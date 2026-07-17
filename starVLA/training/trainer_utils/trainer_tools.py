@@ -187,8 +187,9 @@ class TrainerUtils:
                     print(f"⚠️ module path does not exist, cannot freeze: {path}")
                     continue
 
-        dist.barrier()  # synchronize when distributed training
-        if dist.get_rank == 0:
+        if dist.is_initialized():
+            dist.barrier()  # synchronize when distributed training
+        if not dist.is_initialized() or dist.get_rank() == 0:
             print(f"🔒 Frozen modules with re pattern: {frozen}")
         return model
 
@@ -198,7 +199,7 @@ class TrainerUtils:
         print the total number of parameters and trainable parameters of the model
         :param model: PyTorch model instance
         """
-        if dist.get_rank() != 0:
+        if dist.is_initialized() and dist.get_rank() != 0:
             return
         print("📊 model parameter statistics:")
         num_params = sum(p.numel() for p in model.parameters())
@@ -209,7 +210,12 @@ class TrainerUtils:
         return num_params, num_trainable_params
 
     @staticmethod
-    def load_pretrained_backbones(model, checkpoint_path=None, reload_modules=None):
+    def load_pretrained_backbones(
+        model,
+        checkpoint_path=None,
+        reload_modules=None,
+        allow_mismatched_modules=None,
+    ):
         """
         load checkpoint:
         - if reload_modules is set, load by path part
@@ -220,7 +226,8 @@ class TrainerUtils:
         """
         if not checkpoint_path:
             return []
-        if dist.get_rank() == 0:
+        is_main_process = not dist.is_initialized() or dist.get_rank() == 0
+        if is_main_process:
             print(f"📦 loading checkpoint: {checkpoint_path}")
         try:
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -241,17 +248,64 @@ class TrainerUtils:
                     sub_state_dict = {k[len(prefix) :]: v for k, v in checkpoint.items() if k.startswith(prefix)}
                     if sub_state_dict:
                         module.load_state_dict(sub_state_dict, strict=True)
-                        if dist.get_rank() == 0:
+                        if is_main_process:
                             print(f"✅ parameters loaded to module '{path}'")
                         loaded_modules.append(path)
                     else:
                         print(f"⚠️ parameters not found in checkpoint '{path}'")
                 except AttributeError:
                     print(f"❌ cannot find module path: {path}")
-        else:  # full load
+        elif allow_mismatched_modules:
+            allowed_prefixes = [
+                prefix.strip()
+                for prefix in allow_mismatched_modules.split(",")
+                if prefix.strip()
+            ]
+            model_state = model.state_dict()
+            unexpected_keys = sorted(set(checkpoint) - set(model_state))
+            missing_keys = sorted(set(model_state) - set(checkpoint))
+            mismatched_keys = sorted(
+                key
+                for key in set(checkpoint).intersection(model_state)
+                if checkpoint[key].shape != model_state[key].shape
+            )
+
+            def is_allowed(key):
+                return any(key == prefix or key.startswith(prefix + ".") for prefix in allowed_prefixes)
+
+            disallowed_mismatches = [key for key in mismatched_keys if not is_allowed(key)]
+            if unexpected_keys or missing_keys or disallowed_mismatches:
+                details = []
+                if unexpected_keys:
+                    details.append(f"unexpected keys: {unexpected_keys}")
+                if missing_keys:
+                    details.append(f"missing keys: {missing_keys}")
+                if disallowed_mismatches:
+                    details.append(f"disallowed shape mismatches: {disallowed_mismatches}")
+                raise RuntimeError("❌ incompatible pretrained checkpoint; " + "; ".join(details))
+
+            compatible_checkpoint = {
+                key: value for key, value in checkpoint.items() if key not in mismatched_keys
+            }
+            load_result = model.load_state_dict(compatible_checkpoint, strict=False)
+            if sorted(load_result.missing_keys) != mismatched_keys or load_result.unexpected_keys:
+                raise RuntimeError(
+                    "❌ unexpected result while loading shape-compatible checkpoint: "
+                    f"missing={load_result.missing_keys}, unexpected={load_result.unexpected_keys}"
+                )
+            if is_main_process:
+                print("✅ loaded all shape-compatible pretrained parameters")
+                for key in mismatched_keys:
+                    print(
+                        "♻️ reinitialized shape-mismatched parameter "
+                        f"'{key}': checkpoint={tuple(checkpoint[key].shape)}, "
+                        f"model={tuple(model_state[key].shape)}"
+                    )
+            loaded_modules = ["<shape_compatible_model>"]
+        else:  # full strict load
             try:
                 model.load_state_dict(checkpoint, strict=True)
-                if dist.get_rank() == 0:
+                if is_main_process:
                     print("✅ loaded <full_model> model parameters")
                 loaded_modules = ["<full_model>"]
             except Exception as e:

@@ -124,6 +124,7 @@ class LeRobotSingleDataset(Dataset):
         video_backend_kwargs: dict | None = None,
         transforms: ComposedModalityTransform | None = None,
         delete_pause_frame: bool = False,
+        cache_dir: Path | str | None = None,
     ):
         """
         Initialize the dataset.
@@ -142,6 +143,9 @@ class LeRobotSingleDataset(Dataset):
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
 
         self.delete_pause_frame = delete_pause_frame
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.modality_configs = modality_configs
         self.video_backend = video_backend
@@ -339,7 +343,11 @@ class LeRobotSingleDataset(Dataset):
             }
 
         # 2. Dataset statistics
-        stats_path = self.dataset_path / LE_ROBOT_STATS_FILENAME
+        stats_path = (
+            self.cache_dir / f"{self.dataset_name}_stats_gr00t.json"
+            if self.cache_dir is not None
+            else self.dataset_path / LE_ROBOT_STATS_FILENAME
+        )
         try:
             with open(stats_path, "r") as f:
                 le_statistics = json.load(f)
@@ -400,30 +408,15 @@ class LeRobotSingleDataset(Dataset):
         # Create a hash key based on configuration to ensure cache validity
         config_key = self._get_steps_config_key()
         
-        # Create a unique filename based on config_key
-        steps_filename = f"steps_{config_key}.pkl"
-        # @BUG
-        # fast get static steps @fangjing --> don't use hash to dynamic sample
-        steps_filename =  "steps_data_index.pkl"
-        steps_filename = "steps_332420bad1ab.pkl"
-
-        steps_path = self.dataset_path / "meta" / steps_filename
+        steps_filename = f"{self.dataset_name}_steps_{config_key}.pkl"
+        steps_root = self.cache_dir if self.cache_dir is not None else self.dataset_path / "meta"
+        steps_path = steps_root / steps_filename
         
         # Try to load cached steps first
         try:
-            if steps_path.exists():
-                with open(steps_path, "rb") as f:
-                    cached_data = pickle.load(f)
-                return cached_data["steps"]
-            else:
-                steps_filename = "steps_2d5a34b904d2.pkl"
-                steps_path = self.dataset_path / "meta" / steps_filename
-        
-                with open(steps_path, "rb") as f:
-                    cached_data = pickle.load(f)
-                return cached_data["steps"]
-
-
+            with open(steps_path, "rb") as f:
+                cached_data = pickle.load(f)
+            return cached_data["steps"]
         except (FileNotFoundError, pickle.PickleError, KeyError) as e:
             print(f"Failed to load cached steps: {e}")
             print("Computing steps from scratch...")
@@ -976,8 +969,7 @@ class LeRobotSingleDataset(Dataset):
             array=data_array,
             step_indices=step_indices,
             max_length=max_length,
-            # padding_strategy="first_last" if state_or_action_cfg.absolute else "zero",
-            padding_strategy="zero",           # HACK for realdata
+            padding_strategy="first_last" if state_or_action_cfg.absolute else "zero",
         )
 
     def get_language(
@@ -1379,6 +1371,7 @@ class LeRobotMixtureDataset(Dataset):
         with_state: bool = False,
         resolution_size: int = 224,
         video_resolution_size: int = 256,
+        wm_view_indices: list[int] | None = None,
         seed: int = 42,
         metadata_config: dict = {
             "percentile_mixing_method": "min_max",
@@ -1415,6 +1408,7 @@ class LeRobotMixtureDataset(Dataset):
         self.with_state = with_state
         self.resolution_size = resolution_size
         self.video_resolution_size = video_resolution_size
+        self.wm_view_indices = wm_view_indices
 
         # Set properties for sampling
 
@@ -1594,17 +1588,29 @@ class LeRobotMixtureDataset(Dataset):
                 
                 # Process all video keys dynamically
                 videos, images = [], []
+                num_video_keys = len(dataset.modality_keys["video"])
+                if num_video_keys == 1:
+                    selected_wm_views = [0]
+                elif self.wm_view_indices is None:
+                    selected_wm_views = [0, 2] if num_video_keys > 2 else [0, 1]
+                else:
+                    selected_wm_views = list(self.wm_view_indices)
+                    if len(selected_wm_views) != 2:
+                        raise ValueError(
+                            f"wm_view_indices must contain exactly two indices, got {selected_wm_views}"
+                        )
+                    if min(selected_wm_views) < 0 or max(selected_wm_views) >= num_video_keys:
+                        raise IndexError(
+                            f"wm_view_indices {selected_wm_views} are invalid for {num_video_keys} cameras"
+                        )
                 for i, video_key in enumerate(dataset.modality_keys["video"]):
                     video = data[video_key] # Shape: (T, H, W, C)
                     video = self.resize_video_opencv(video, self.video_resolution_size)
-                    if len(dataset.modality_keys["video"]) > 2:
-                        if i in [0, 2]:
-                            videos.append(video)
-                    else:
+                    if i in selected_wm_views:
                         videos.append(video)
                     primary_image = Image.fromarray(video[0]).resize((self.resolution_size, self.resolution_size))
                     images.append(primary_image)
-                if len(dataset.modality_keys["video"]) == 1:
+                if num_video_keys == 1:
                     videos = [videos[0], videos[0].copy()]  # Duplicate if only one video
                 videos = np.stack(videos, axis=0)  # Shape: (V, T, H, W, C)        
                     
@@ -2122,6 +2128,3 @@ class LeRobotMixtureDataset(Dataset):
                 dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
         
         print(f"Applied cached statistics for {len(self.merged_metadata)} embodiment tags.")
-
-
-

@@ -41,19 +41,34 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
         from starVLA.dataloader.lerobot_datasets import get_vla_dataset, collate_fn
         vla_dataset_cfg = cfg.datasets.vla_data
 
-        vla_dataset = get_vla_dataset(
-            data_cfg=vla_dataset_cfg,
-            action_horizon=cfg.framework.action_model.action_horizon,
-            video_horizon=cfg.framework.vj2_model.num_frames)
+        def build_vla_dataset():
+            return get_vla_dataset(
+                data_cfg=vla_dataset_cfg,
+                action_horizon=cfg.framework.action_model.action_horizon,
+                video_horizon=cfg.framework.vj2_model.num_frames,
+                cache_dir=Path(cfg.output_dir) / "dataset_cache",
+            )
+
+        # Dataset initialization may create statistics and sampling caches.
+        # Let rank 0 create them first so the remaining ranks only read them.
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            if dist.get_rank() == 0:
+                vla_dataset = build_vla_dataset()
+            dist.barrier()
+            if dist.get_rank() != 0:
+                vla_dataset = build_vla_dataset()
+            dist.barrier()
+        else:
+            vla_dataset = build_vla_dataset()
         
         vla_train_dataloader = DataLoader(
             vla_dataset,
             batch_size=cfg.datasets.vla_data.per_device_batch_size,
             collate_fn=collate_fn,
-            num_workers=8,
+            num_workers=cfg.datasets.vla_data.get("num_workers", 8),
             # shuffle=True
         )        
-        if dist.get_rank() == 0: 
+        if not dist.is_initialized() or dist.get_rank() == 0:
             
             output_dir = Path(cfg.output_dir)
             vla_dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")

@@ -100,10 +100,52 @@ For robot datasets, you need to add a `modality.json` file under the `meta/` sub
 Depending on whether you are conducting pre-training or post-training, select the appropriate training script and YAML configuration file from the [`/scripts`](./scripts) directory.
 
 Ensure the following configurations are updated in the YAML file:
-- `framework.qwenvl.basevlm` and `framework.vj2_model.base_encoder` should be set to the paths of your respective checkpoints.
+- `framework.qwenvl.base_vlm` and `framework.vj2_model.base_encoder` should be set to the paths of your respective checkpoints.
 - Update `datasets.vla_data.data_root_dir`, `datasets.video_data.video_dir`, and `datasets.video_data.text_file` to match the paths of your datasets.
 
 Once the configurations are updated, you can proceed to start the training process.
+
+#### Put Mango v2.1 (4 GPUs)
+
+The repository includes a ready-to-run fine-tuning setup for
+`datasets/put_mango_v21`. It loads the VLA-JEPA pretrained checkpoint, freezes
+the V-JEPA encoder, and trains Qwen3-VL, the V-JEPA predictor, and the action
+head with DeepSpeed ZeRO-2. W&B logging is enabled by default.
+
+```bash
+conda activate VLA_JEPA
+wandb login
+bash scripts/vlajepa_put_mango_4gpu.sh
+```
+
+Common settings can be overridden without editing the YAML file:
+
+```bash
+RUN_ID=put_mango_trial_01 \
+MAX_TRAIN_STEPS=10000 \
+PER_DEVICE_BATCH_SIZE=4 \
+GRAD_ACCUM_STEPS=2 \
+WARMUP_STEPS=1000 \
+SAVE_INTERVAL=1000 \
+KEEP_LATEST_CHECKPOINT_ONLY=true \
+EVAL_INTERVAL=500 \
+LOGGING_FREQUENCY=10 \
+QWEN_LR=1e-5 \
+VJ_PREDICTOR_LR=3e-5 \
+ACTION_LR=1e-4 \
+WANDB_PROJECT=vla-jepa-put-mango \
+bash scripts/vlajepa_put_mango_4gpu.sh
+```
+
+The defaults use GPUs `0,1,2,3`, a per-device batch size of 4, and gradient
+accumulation of 2 (global batch size 32). Set `WANDB_MODE=offline` for an
+offline run or `WANDB_MODE=disabled` for a smoke test. See
+[`scripts/config/vlajepa_put_mango_ft.yaml`](./scripts/config/vlajepa_put_mango_ft.yaml)
+for all model, dataset, and optimizer settings.
+The dataset modality mapping is also kept at
+[`examples/put_mango_v21/modality.json`](./examples/put_mango_v21/modality.json).
+Periodic saves keep only the newest step checkpoint by default; the final model
+is still saved separately when training completes.
 
 <a id="optional-custom-dataset-training"></a>
 ### 3️⃣ Optional: Custom Dataset Training

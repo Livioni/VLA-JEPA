@@ -99,6 +99,10 @@ class VLA_JEPA(baseframework):
 
         self.embodied_replace_prompt = "".join([embodied_action_token * self.config.framework.vj2_model.num_embodied_action_tokens_per_instruction])
 
+        if self.config.trainer.get("enable_gradient_checkpointing", False):
+            self.qwen_vl_interface.model.gradient_checkpointing_enable()
+            self.qwen_vl_interface.model.config.use_cache = False
+
     def expand_tokenizer(self, 
                          tokenizer: AutoTokenizer,
                          special_action_token: str = "<|action_{}|>",
@@ -255,7 +259,9 @@ class VLA_JEPA(baseframework):
             actions_target = actions[:, -(self.future_action_window_size+1):, :]  # (B, chunk_len, action_dim)
 
             repeated_diffusion_steps = (
-                self.config.trainer.get("repeated_diffusion_steps", 4) if self.config and self.config.trainer else 4
+                self.config.framework.action_model.get("repeated_diffusion_steps", 4)
+                if self.config and self.config.framework.action_model
+                else 4
             )
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             embodied_action_repeated = embodied_action_tokens.repeat(repeated_diffusion_steps, 1, 1)

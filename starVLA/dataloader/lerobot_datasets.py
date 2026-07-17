@@ -17,6 +17,7 @@ def make_LeRobotSingleDataset(
     delete_pause_frame: bool = False,
     action_horizon: int = 7,
     video_horizon: int = 16,
+    cache_dir: Path | str | None = None,
 ) -> LeRobotSingleDataset:
     """
     Make a LeRobotSingleDataset object.
@@ -47,6 +48,7 @@ def make_LeRobotSingleDataset(
         embodiment_tag=embodiment_tag,
         video_backend="torchvision_av",
         delete_pause_frame=delete_pause_frame,
+        cache_dir=cache_dir,
     )
 
 def get_vla_dataset(
@@ -58,6 +60,7 @@ def get_vla_dataset(
     delete_pause_frame: bool = True,
     action_horizon: int = 7,
     video_horizon: int = 16,
+    cache_dir: Path | str | None = None,
     **kwargs: dict,
 ) -> LeRobotMixtureDataset:
     """
@@ -65,6 +68,7 @@ def get_vla_dataset(
     """
     data_root_dir = data_cfg.data_root_dir
     data_mix = data_cfg.data_mix
+    delete_pause_frame = data_cfg.get("delete_pause_frame", delete_pause_frame)
     mixture_spec = DATASET_NAMED_MIXTURES[data_mix]
     included_datasets, filtered_mixture_spec = set(), []
     for d_name, d_weight, robot_type in mixture_spec:  
@@ -83,7 +87,8 @@ def get_vla_dataset(
                                                           robot_type, 
                                                           delete_pause_frame=delete_pause_frame, 
                                                           action_horizon=action_horizon,
-                                                          video_horizon=video_horizon), d_weight))
+                                                          video_horizon=video_horizon,
+                                                          cache_dir=cache_dir), d_weight))
 
     return LeRobotMixtureDataset(
         dataset_mixture,
@@ -93,6 +98,7 @@ def get_vla_dataset(
         with_state=data_cfg.get("with_state", False),
         resolution_size=data_cfg.get("resolution_size", 224),
         video_resolution_size=data_cfg.get("video_resolution_size", 256),
+        wm_view_indices=data_cfg.get("wm_view_indices", None),
         seed=seed,
         **kwargs,
     )
