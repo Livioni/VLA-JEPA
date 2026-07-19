@@ -20,6 +20,8 @@ from torch.utils.tensorboard import SummaryWriter
 import argparse
 import json
 import os
+import random
+import shutil
 from pathlib import Path
 from typing import Tuple
 from torch.utils.data import Dataset, DataLoader
@@ -146,9 +148,11 @@ class VLATrainer(TrainerUtils):
             else None
         )
         self.wandb_run = None
+        self.wandb_run_id = None
 
         # training status tracking
         self.completed_steps = 0
+        self.consumed_vla_batches = 0
         self.total_batch_size = self._calculate_total_batch_size()
 
     def prepare_training(self):
@@ -156,8 +160,16 @@ class VLATrainer(TrainerUtils):
         seed = self.config.seed + rank if hasattr(self.config, "seed") else rank + 3047
         set_seed(seed)
 
-        # load pretrained weights
-        if hasattr(self.config.trainer, "pretrained_checkpoint") and self.config.trainer.pretrained_checkpoint:
+        # A full-state resume will restore the model after DeepSpeed has been
+        # initialized, so avoid loading the large pretrained checkpoint first.
+        resume_from_checkpoint = self.config.trainer.get("resume_from_checkpoint", None)
+
+        # load pretrained weights for a fresh training run
+        if (
+            not resume_from_checkpoint
+            and hasattr(self.config.trainer, "pretrained_checkpoint")
+            and self.config.trainer.pretrained_checkpoint
+        ):
             pretrained_checkpoint = self.config.trainer.pretrained_checkpoint
             reload_modules = (
                 self.config.trainer.reload_modules if hasattr(self.config.trainer, "reload_modules") else None
@@ -190,8 +202,8 @@ class VLATrainer(TrainerUtils):
             # self.vlm_train_dataloader
         )
 
-        self._init_wandb()
         self._init_checkpointing()
+        self._init_wandb()
 
     def _calculate_total_batch_size(self):
         """calculate global batch size"""
@@ -207,6 +219,9 @@ class VLATrainer(TrainerUtils):
         if self.accelerator.is_main_process and "wandb" in trackers:
             wandb_dir = os.path.join(self.config.output_dir, "wandb")
             os.makedirs(wandb_dir, exist_ok=True)
+            wandb_resume_kwargs = {}
+            if self.wandb_run_id:
+                wandb_resume_kwargs = {"id": self.wandb_run_id, "resume": "allow"}
             self.wandb_run = wandb.init(
                 name=self.config.run_id,
                 dir=wandb_dir,
@@ -214,44 +229,124 @@ class VLATrainer(TrainerUtils):
                 entity=self.config.get("wandb_entity", None),
                 group=self.config.get("wandb_group", "vla-train"),
                 config=OmegaConf.to_container(self.config, resolve=True),
+                **wandb_resume_kwargs,
             )
+            self.wandb_run_id = self.wandb_run.id
 
     def _init_checkpointing(self):
         """initialize checkpoint directory"""
         self.checkpoint_dir = os.path.join(self.config.output_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
-        pretrained_checkpoint = getattr(self.config.trainer, "pretrained_checkpoint", None)
-        is_resume = getattr(self.config.trainer, "is_resume", False)
+        # The scheduler is intentionally stepped outside Accelerate, so it is
+        # not part of Accelerator._schedulers. Register it and this trainer's
+        # progress counters as custom checkpoint state.
+        self.accelerator.register_for_checkpointing(self.lr_scheduler, self)
 
-        # resume training state
-        if pretrained_checkpoint and is_resume:
-            self._load_checkpoint(self.config.resume_from_checkpoint)
+        resume_from_checkpoint = self.config.trainer.get("resume_from_checkpoint", None)
+        if resume_from_checkpoint:
+            self._load_checkpoint(self._resolve_resume_checkpoint(resume_from_checkpoint))
+
+    def _resolve_resume_checkpoint(self, checkpoint_path):
+        """Resolve an explicit checkpoint directory or the newest local one."""
+        if str(checkpoint_path).lower() == "latest":
+            candidates = []
+            for path in Path(self.checkpoint_dir).glob("steps_*"):
+                if not path.is_dir():
+                    continue
+                try:
+                    step = int(path.name.removeprefix("steps_"))
+                except ValueError:
+                    continue
+                candidates.append((step, path))
+            if not candidates:
+                raise FileNotFoundError(f"No full-state checkpoints found in {self.checkpoint_dir}")
+            return max(candidates, key=lambda item: item[0])[1]
+
+        checkpoint_path = Path(checkpoint_path).expanduser()
+        if not checkpoint_path.is_absolute():
+            checkpoint_path = Path.cwd() / checkpoint_path
+        checkpoint_path = checkpoint_path.resolve()
+        if not checkpoint_path.is_dir():
+            raise FileNotFoundError(f"Resume checkpoint directory does not exist: {checkpoint_path}")
+        return checkpoint_path
 
     def _load_checkpoint(self, checkpoint_path):
-        """load checkpoint"""
-        self.accelerator.load_state(checkpoint_path)
+        """Load model, optimizer, scheduler, progress, and per-rank RNG state."""
+        self.accelerator.load_state(str(checkpoint_path))
+        self._load_rank_rng_state(checkpoint_path)
         self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
 
+    def _rank_rng_state_path(self, checkpoint_path):
+        return Path(checkpoint_path) / f"rank_rng_state_{self.accelerator.process_index}.pt"
+
+    def _save_rank_rng_state(self, checkpoint_path):
+        """Save RNG state for every rank (Accelerate 1.5 only writes rank 0)."""
+        state = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            state["cuda"] = torch.cuda.get_rng_state_all()
+        torch.save(state, self._rank_rng_state_path(checkpoint_path))
+
+    def _load_rank_rng_state(self, checkpoint_path):
+        """Restore the RNG stream used by this distributed rank."""
+        rng_path = self._rank_rng_state_path(checkpoint_path)
+        if not rng_path.is_file():
+            raise FileNotFoundError(f"Per-rank RNG state is missing from checkpoint: {rng_path}")
+        state = torch.load(rng_path, map_location="cpu", weights_only=False)
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch"])
+        if torch.cuda.is_available() and "cuda" in state:
+            torch.cuda.set_rng_state_all(state["cuda"])
+
+    def state_dict(self):
+        """Small trainer state saved alongside the DeepSpeed checkpoint."""
+        return {
+            "version": 1,
+            "completed_steps": int(self.completed_steps),
+            "consumed_vla_batches": int(self.consumed_vla_batches),
+            "wandb_run_id": self.wandb_run_id,
+        }
+
+    def load_state_dict(self, state_dict):
+        """Restore trainer progress before the data iterator is constructed."""
+        version = int(state_dict.get("version", 0))
+        if version != 1:
+            raise ValueError(f"Unsupported trainer checkpoint state version: {version}")
+        self.completed_steps = int(state_dict["completed_steps"])
+        self.consumed_vla_batches = int(state_dict["consumed_vla_batches"])
+        self.wandb_run_id = state_dict.get("wandb_run_id")
+
     def _save_checkpoint(self):
-        """save current training state"""
+        """Save a complete DeepSpeed/Accelerate training state."""
 
-        checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
-        state_dict = self.accelerator.get_state_dict(self.model)
+        checkpoint_path = Path(self.checkpoint_dir) / f"steps_{self.completed_steps}"
+        self.accelerator.save_state(str(checkpoint_path), safe_serialization=False)
+        self._save_rank_rng_state(checkpoint_path)
+        self.accelerator.wait_for_everyone()
+
         if self.accelerator.is_main_process:
-            checkpoint_file = Path(checkpoint_path + "_pytorch_model.pt")
-            torch.save(state_dict, checkpoint_file)
-
-            # Keep the previous checkpoint until the new one has been written
-            # successfully, then remove older periodic checkpoints.
+            # Keep the previous checkpoint until every rank has successfully
+            # written the new one, then remove older full-state directories and
+            # legacy weight-only checkpoint files.
             if self.config.trainer.get("keep_latest_checkpoint_only", True):
-                for old_checkpoint in Path(self.checkpoint_dir).glob("steps_*_pytorch_model.pt"):
-                    if old_checkpoint != checkpoint_file:
+                for old_checkpoint in Path(self.checkpoint_dir).glob("steps_*"):
+                    if old_checkpoint == checkpoint_path:
+                        continue
+                    if old_checkpoint.is_symlink() or old_checkpoint.is_file():
                         old_checkpoint.unlink()
+                    elif old_checkpoint.is_dir():
+                        shutil.rmtree(old_checkpoint)
 
             # save training metadata
             summary_data = {
                 "steps": self.completed_steps,
+                "consumed_vla_batches": self.consumed_vla_batches,
+                "checkpoint": str(checkpoint_path),
             }
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
                 f.write(json.dumps(summary_data) + "\n")
@@ -282,8 +377,29 @@ class VLATrainer(TrainerUtils):
         return reduced
 
     def _create_data_iterators(self):
-        """create data iterators"""
-        self.vla_iter = iter(self.vla_train_dataloader)
+        """Create the data iterator, restoring its logical epoch and offset."""
+        epoch_length = len(self.vla_train_dataloader)
+        if epoch_length <= 0:
+            raise ValueError("The prepared VLA dataloader is empty")
+
+        epoch, batches_to_skip = divmod(self.consumed_vla_batches, epoch_length)
+        self.vla_epoch_count = epoch
+        if callable(getattr(self.vla_train_dataloader, "set_epoch", None)):
+            self.vla_train_dataloader.set_epoch(epoch)
+
+        if batches_to_skip:
+            resume_dataloader = self.accelerator.skip_first_batches(
+                self.vla_train_dataloader,
+                num_batches=batches_to_skip,
+            )
+            if callable(getattr(resume_dataloader, "set_epoch", None)):
+                resume_dataloader.set_epoch(epoch)
+            self.vla_iter = iter(resume_dataloader)
+            self.accelerator.print(
+                f"Resuming dataloader at epoch {epoch}, batch {batches_to_skip}/{epoch_length}"
+            )
+        else:
+            self.vla_iter = iter(self.vla_train_dataloader)
         # self.vlm_iter = iter(self.vlm_train_dataloader)
 
     def _get_next_batch(self):
@@ -291,13 +407,12 @@ class VLATrainer(TrainerUtils):
         try:
             batch_vla = next(self.vla_iter)
         except StopIteration:
-            if not hasattr(self, "vla_epoch_count"):
-                self.vla_epoch_count = 0
             self.vla_iter, self.vla_epoch_count = TrainerUtils._reset_dataloader(
                 self.vla_train_dataloader, self.vla_epoch_count
             )
             batch_vla = next(self.vla_iter)
 
+        self.consumed_vla_batches += 1
         return batch_vla
 
     import torch
@@ -367,7 +482,9 @@ class VLATrainer(TrainerUtils):
 
         # create progress bar
         progress_bar = tqdm(
-            range(self.config.trainer.max_train_steps), disable=not self.accelerator.is_local_main_process
+            total=self.config.trainer.max_train_steps,
+            initial=min(self.completed_steps, self.config.trainer.max_train_steps),
+            disable=not self.accelerator.is_local_main_process,
         )
 
         # main training loop
@@ -468,7 +585,6 @@ class VLATrainer(TrainerUtils):
     def _train_step(self, batch_vla, batch_vlm=None):
         """execute single training step"""
         with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
             # VLA task forward propagation
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
@@ -488,6 +604,11 @@ class VLATrainer(TrainerUtils):
             # optimizer step rather than once per process or micro-batch.
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
+            # AcceleratedOptimizer.zero_grad() is a no-op on accumulation
+            # micro-steps and clears gradients after the synchronized update.
+            # Calling it before backward would discard previously accumulated
+            # gradients on the final micro-step.
+            self.optimizer.zero_grad()
             
             result_dict = {f"train/{k}": v.detach().item() for k, v in output_dict.items()}
             result_dict["train/total_loss"] = total_loss.detach().item()

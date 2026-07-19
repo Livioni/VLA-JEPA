@@ -128,6 +128,7 @@ GRAD_ACCUM_STEPS=2 \
 WARMUP_STEPS=1000 \
 SAVE_INTERVAL=1000 \
 KEEP_LATEST_CHECKPOINT_ONLY=true \
+SAVE_FINAL_MODEL=true \
 EVAL_INTERVAL=500 \
 LOGGING_FREQUENCY=10 \
 QWEN_LR=1e-5 \
@@ -137,8 +138,8 @@ WANDB_PROJECT=vla-jepa-put-mango \
 bash scripts/vlajepa_put_mango_4gpu.sh
 ```
 
-The defaults use GPUs `0,1,2,3`, a per-device batch size of 4, and gradient
-accumulation of 2 (global batch size 32). Set `WANDB_MODE=offline` for an
+The defaults use GPUs `0,1,2,3`, a per-device batch size of 16, and gradient
+accumulation of 1 (global batch size 64). Set `WANDB_MODE=offline` for an
 offline run or `WANDB_MODE=disabled` for a smoke test. See
 [`scripts/config/vlajepa_put_mango_ft.yaml`](./scripts/config/vlajepa_put_mango_ft.yaml)
 for all model, dataset, and optimizer settings.
@@ -146,6 +147,21 @@ The dataset modality mapping is also kept at
 [`examples/put_mango_v21/modality.json`](./examples/put_mango_v21/modality.json).
 Periodic saves keep only the newest step checkpoint by default; the final model
 is still saved separately when training completes.
+
+Periodic checkpoint directories contain the complete DeepSpeed training state:
+model weights, AdamW state, learning-rate scheduler, completed step, dataloader
+position, per-rank random-number-generator states, and the W&B run ID. Resume
+into the same run directory with:
+
+```bash
+RUN_ID=put_mango_trial_01 \
+RESUME_FROM_CHECKPOINT=outputs/put_mango_trial_01/checkpoints/steps_5000 \
+bash scripts/vlajepa_put_mango_4gpu.sh
+```
+
+When `RUN_ID` points to the original run directory, you can instead set
+`RESUME_FROM_CHECKPOINT=latest`. Legacy `steps_*_pytorch_model.pt` files contain
+weights only and cannot be used for full-state resume.
 
 <a id="optional-custom-dataset-training"></a>
 ### 3️⃣ Optional: Custom Dataset Training

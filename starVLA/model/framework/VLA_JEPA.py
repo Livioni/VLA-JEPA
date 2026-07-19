@@ -339,7 +339,10 @@ class VLA_JEPA(baseframework):
         with torch.autocast("cuda", dtype=torch.float32):
             pred_actions = self.action_model.predict_action(embodied_action_tokens, state)  # (B, chunk_len, action_dim)
 
-        normalized_actions = pred_actions.detach().cpu().numpy()
+        # NumPy cannot represent torch.bfloat16 tensors. DeepSpeed casts this
+        # module to BF16, so convert inference outputs to FP32 before moving
+        # them to CPU for diagnostics or downstream policy code.
+        normalized_actions = pred_actions.detach().float().cpu().numpy()
         return {"normalized_actions": normalized_actions, "embodied_action_tokens": embodied_action_tokens.to(dtype=torch.float32).detach().cpu().numpy()}
 
 

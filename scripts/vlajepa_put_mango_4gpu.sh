@@ -26,6 +26,7 @@ EVAL_INTERVAL="${EVAL_INTERVAL:-500}"
 LOGGING_FREQUENCY="${LOGGING_FREQUENCY:-20}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 SAVE_FINAL_MODEL="${SAVE_FINAL_MODEL:-true}"
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 QWEN_LR="${QWEN_LR:-1e-5}"
 VJ_PREDICTOR_LR="${VJ_PREDICTOR_LR:-3e-5}"
 ACTION_LR="${ACTION_LR:-1e-4}"
@@ -73,6 +74,14 @@ TRAIN_ARGS=(
 
 if [[ -n "${WANDB_ENTITY}" ]]; then
   TRAIN_ARGS+=(--wandb_entity "${WANDB_ENTITY}")
+fi
+
+if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
+  if [[ "${RESUME_FROM_CHECKPOINT}" != "latest" && ! -d "${RESUME_FROM_CHECKPOINT}" ]]; then
+    echo "Resume checkpoint directory does not exist: ${RESUME_FROM_CHECKPOINT}" >&2
+    exit 1
+  fi
+  TRAIN_ARGS+=(--trainer.resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
 fi
 
 accelerate launch \

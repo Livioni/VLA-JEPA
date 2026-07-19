@@ -102,8 +102,8 @@ trainer:
     betas: [0.9, 0.95]
     eps: 1.0e-08
     weight_decay: 1.0e-08
-  is_resume: false
-  resume_epoch: null
-  resume_step: null
+  # Directory produced by accelerator.save_state, or "latest" when reusing
+  # the same RUN_ROOT_DIR/RUN_ID. Leave null for a fresh fine-tuning run.
+  resume_from_checkpoint: null
   enable_gradient_checkpointing: true
   enable_mixed_precision_training: true
